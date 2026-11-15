@@ -91,6 +91,42 @@ CREATE TABLE IF NOT EXISTS results (
     codes_json      TEXT NOT NULL,
     PRIMARY KEY (run_id, hotspot_seq)
 );
+
+-- One coverage check = one satellite footprint (already unioned) evaluated
+-- against exactly one immutable map version.  A check stays readable after a
+-- map swap; staleness is derived by comparing map_version_id with the active
+-- version at read time.
+CREATE TABLE IF NOT EXISTS coverage_checks (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename        TEXT NOT NULL,
+    sha256          TEXT NOT NULL,
+    map_version_id  INTEGER NOT NULL REFERENCES map_versions(id),
+    status          TEXT NOT NULL,           -- succeeded (kept for extension)
+    error           TEXT,
+    created_at      TEXT NOT NULL,
+    finished_at     TEXT,
+    feature_count   INTEGER NOT NULL DEFAULT 0,
+    footprint_geom  BLOB NOT NULL,
+    footprint_area_m2 REAL NOT NULL DEFAULT 0,
+    total_area_m2   REAL NOT NULL DEFAULT 0,
+    covered_area_m2 REAL NOT NULL DEFAULT 0,
+    uncovered_area_m2 REAL NOT NULL DEFAULT 0,
+    uncovered_ratio REAL NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS ix_coverage_checks_map ON coverage_checks (map_version_id, id);
+
+CREATE TABLE IF NOT EXISTS coverage_results (
+    check_id        INTEGER NOT NULL REFERENCES coverage_checks(id) ON DELETE CASCADE,
+    compartment_seq INTEGER NOT NULL,
+    code            TEXT NOT NULL,
+    area_m2         REAL NOT NULL,
+    covered_area_m2 REAL NOT NULL,
+    uncovered_area_m2 REAL NOT NULL,
+    uncovered_ratio REAL NOT NULL,
+    uncovered_geom  BLOB,
+    PRIMARY KEY (check_id, compartment_seq)
+);
 """
 
 

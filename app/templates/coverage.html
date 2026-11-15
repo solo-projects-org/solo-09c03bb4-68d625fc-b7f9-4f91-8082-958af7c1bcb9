@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}过境覆盖核查 · 林火遥感{% endblock %}
+{% block content %}
+<section class="card">
+  <h2>卫星过境覆盖核查</h2>
+  <p class="hint">
+    上传本次过境观测足迹的 <strong>面 GeoJSON</strong>（Feature / FeatureCollection，WGS84 经纬度）。
+    系统按<strong>核查开始时读取的当前林班底图版本</strong>逐个林班计算未覆盖比例，并可下载未覆盖区域 GeoJSON，
+    用于安排补采。重叠足迹会先合并为一个覆盖范围，只计一次；面积按 WGS84 椭球测地面积计算，不使用经纬度平面面积。
+  </p>
+  {% if not active_map %}
+    <div class="flash flash-warn">尚未上传林班底图，无法核查。请先在 <a href="/">首页</a> 发布底图。</div>
+  {% else %}
+    <p class="hint">
+      当前底图：<strong>v{{ active_map.id }} · {{ active_map.filename }}</strong>
+      （sha256 <span class="mono">{{ active_map.sha256[:16] }}…</span>，{{ active_map.feature_count }} 个林班）
+    </p>
+  {% endif %}
+  <form method="post" action="/coverage" enctype="multipart/form-data" class="stack">
+    <input type="file" name="file" accept=".geojson,.json,application/geo+json,application/json" required
+           {% if not active_map %}disabled{% endif %}>
+    <button type="submit" {% if not active_map %}disabled{% endif %}>核查未覆盖林班</button>
+  </form>
+  <p class="hint">
+    足迹必须是有效面（不支持点/线/无效几何/非 WGS84 坐标系）。校验失败时不会产生任何部分结果，
+    原有热点归属与下载不受影响。
+  </p>
+</section>
+
+<section class="card">
+  <h2>核查记录</h2>
+  {% if not checks %}
+    <p class="empty">还没有覆盖核查记录。可先用 <code>samples/footprint_v1.geojson</code> 演示。</p>
+  {% else %}
+  <div class="table-wrap">
+  <table class="rows">
+    <thead>
+      <tr>
+        <th>核查</th><th>足迹文件</th><th>底图</th><th>未覆盖面积 (km²)</th>
+        <th>未覆盖比例</th><th>检查时间 (UTC)</th><th>状态</th><th>操作</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for item in checks %}
+      <tr>
+        <td>#{{ item.id }}</td>
+        <td class="mono">{{ item.filename }}</td>
+        <td>v{{ item.map_version_id }} <span class="muted mono">{{ item.map_filename }}</span></td>
+        <td class="mono">{{ '%.4f'|format(item.uncovered_area_m2 / 1000000) }}</td>
+        <td class="mono">{{ '%.2f'|format(item.uncovered_ratio * 100) }}%</td>
+        <td class="mono">{{ item.finished_at or item.created_at }}</td>
+        <td>
+          {% if item.stale %}<span class="pill pill-warn">已过期（底图已更换）</span>
+          {% else %}<span class="pill pill-ok">基于当前底图</span>{% endif %}
+        </td>
+        <td class="actions">
+          <a class="button" href="/coverage/{{ item.id }}">查看</a>
+          <a class="button secondary" href="/coverage/{{ item.id }}/uncovered.geojson">下载未覆盖 GeoJSON</a>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+</section>
+{% endblock %}

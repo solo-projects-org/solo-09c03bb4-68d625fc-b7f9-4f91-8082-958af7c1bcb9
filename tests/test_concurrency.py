@@ -223,3 +223,79 @@ def test_concurrent_map_swaps_leave_exactly_one_active(tmp_path):
     finally:
         server_a.stop()
         server_b.stop()
+
+
+@pytest.mark.slow
+def test_coverage_check_shared_across_instances_and_stale_after_swap(tmp_path):
+    """A check made on one instance is visible on the other and pins its map.
+
+    After the other instance swaps the map, the old check is reported stale
+    but keeps its original version label; only a re-check reads the new map.
+    """
+
+    db_path = tmp_path / "forest.db"
+    port_a, port_b = free_port(), free_port()
+    server_a = Server(db_path, port_a, tmp_path)
+    server_b = Server(db_path, port_b, tmp_path)
+    server_a.wait_ready()
+    server_b.wait_ready()
+    try:
+        with httpx.Client(base_url=server_a.base, timeout=30) as client_a, httpx.Client(
+            base_url=server_b.base, timeout=30
+        ) as client_b:
+            upload_map(client_a, "v1.geojson", (SAMPLES / "compartments_v1.geojson").read_bytes())
+            response = client_b.post(
+                f"{client_b.base_url}/coverage",
+                files={
+                    "file": (
+                        "footprint_v1.geojson",
+                        (SAMPLES / "footprint_v1.geojson").read_bytes(),
+                        "application/geo+json",
+                    )
+                },
+                follow_redirects=False,
+            )
+            assert response.status_code == 303
+
+            first = client_a.get(f"{client_a.base_url}/api/coverage/1").json()
+            assert first["map_version_id"] == 1
+            assert first["stale"] is False
+            assert first["active_map_version"] == 1
+            codes = {row["code"] for row in first["compartments"]}
+            assert codes == {"A-01", "B-02", "C-03", "D-04", "E-05"}
+            exported = client_a.get(f"{client_a.base_url}/coverage/1/uncovered.geojson")
+            assert exported.status_code == 200
+            assert json.loads(exported.content)["name"].endswith("map_v1")
+
+            # Instance A swaps the base map; instance B's old check is stale
+            # but still labelled and computed against v1.
+            upload_map(client_a, "v2.geojson", (SAMPLES / "compartments_v2.geojson").read_bytes())
+            stale = client_b.get(f"{client_b.base_url}/api/coverage/1").json()
+            assert stale["map_version_id"] == 1
+            assert stale["active_map_version"] == 2
+            assert stale["stale"] is True
+            assert stale["uncovered_area_m2"] == pytest.approx(
+                first["uncovered_area_m2"], rel=1e-12
+            )
+            assert "已过期" in client_b.get(f"{client_b.base_url}/coverage/1").text
+
+            # Re-check (on either instance) reads the new active version.
+            response = client_b.post(
+                f"{client_b.base_url}/coverage/1/recheck", follow_redirects=False
+            )
+            assert response.status_code == 303
+            fresh = client_a.get(f"{client_a.base_url}/api/coverage/2").json()
+            assert fresh["map_version_id"] == 2
+            assert fresh["stale"] is False
+            assert {row["code"] for row in fresh["compartments"]} == {
+                "A-01",
+                "C-03",
+                "D-04",
+                "F-06",
+                "E-05",
+            }
+            # The old check remains untouched and still labelled v1.
+            assert client_a.get(f"{client_a.base_url}/api/coverage/1").json()["map_version_id"] == 1
+    finally:
+        server_a.stop()
+        server_b.stop()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
@@ -15,7 +16,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import __version__, db, service
+from . import __version__, coverage, db, service
 from .parsing import InputError
 from .worker import Worker
 
@@ -256,6 +257,148 @@ def create_app(db_path: str | None = None, start_worker: bool | None = None) -> 
                     "error": run["error"],
                 }
                 for run in runs
+            ],
+        }
+
+    @app.get("/coverage", response_class=HTMLResponse)
+    def coverage_index(request: Request, msg: str | None = None, err: str | None = None):
+        with conn() as c:
+            active_map = service.get_active_map(c)
+            checks = coverage.list_checks(c)
+        for check in checks:
+            check["stale"] = coverage.is_stale(check, active_map.id if active_map else None)
+        return render(
+            request,
+            "coverage.html",
+            {
+                "active_map": active_map,
+                "checks": checks,
+                "msg": msg,
+                "err": err,
+                "max_mb": app.state.settings["upload_max_mb"],
+            },
+        )
+
+    @app.post("/coverage")
+    def upload_footprint(request: Request, file: UploadFile = File(...)):
+        try:
+            data = _read_upload(file, app.state.settings["upload_max_mb"], "足迹 GeoJSON")
+            check_id, stale = coverage.create_coverage(
+                app.state.settings["db_path"],
+                data,
+                _safe_filename(file.filename, "footprint.geojson"),
+            )
+        except InputError as exc:
+            # Nothing was written: the page keeps its previous checks and the
+            # hotspot attribution/download pages are untouched.
+            return _redirect("/coverage", err=str(exc))
+        except Exception:  # noqa: BLE001 - no partial result may be shown
+            log.exception("coverage check failed")
+            return _redirect("/coverage", err="覆盖核查失败，未生成任何结果；请检查文件后重试")
+        if stale:
+            return _redirect(
+                f"/coverage/{check_id}",
+                msg="核查已完成，但检查期间底图已被另一实例更换；结果仍按核查开始时读取的底图标示，请重新检查以使用新底图",
+            )
+        return _redirect(f"/coverage/{check_id}", msg="覆盖核查完成")
+
+    @app.post("/coverage/{check_id}/recheck")
+    def recheck_footprint(request: Request, check_id: int):
+        try:
+            prepared = coverage.prepare_recheck(app.state.settings["db_path"], check_id)
+            new_id, stale = coverage.execute_coverage(app.state.settings["db_path"], prepared)
+        except InputError as exc:
+            return _redirect(f"/coverage/{check_id}", err=str(exc))
+        except Exception:  # noqa: BLE001 - no partial result may be shown
+            log.exception("coverage re-check failed")
+            return _redirect(
+                f"/coverage/{check_id}", err="重新检查失败，未生成任何新结果；请稍后重试"
+            )
+        if stale:
+            return _redirect(
+                f"/coverage/{new_id}",
+                msg="重新检查已完成，但检查期间底图再次被更换；结果仍按本次读取的底图标示，请再次检查",
+            )
+        return _redirect(f"/coverage/{new_id}", msg=f"已按当前底图 v{prepared.map_version_id} 重新检查")
+
+    @app.get("/coverage/{check_id}", response_class=HTMLResponse)
+    def coverage_detail(
+        request: Request,
+        check_id: int,
+        msg: str | None = None,
+        err: str | None = None,
+    ):
+        with conn() as c:
+            check = coverage.get_check(c, check_id)
+            if check is None:
+                raise HTTPException(status_code=404, detail="覆盖核查记录不存在")
+            active_map = service.get_active_map(c)
+            results = coverage.get_results(c, check_id)
+        stale = coverage.is_stale(check, active_map.id if active_map else None)
+        partial_rows = [row for row in results if row["uncovered_geom"]]
+        return render(
+            request,
+            "coverage_detail.html",
+            {
+                "check": check,
+                "active_map": active_map,
+                "results": results,
+                "stale": stale,
+                "partial_count": len(partial_rows),
+                "msg": msg,
+                "err": err,
+            },
+        )
+
+    @app.get("/coverage/{check_id}/uncovered.geojson")
+    def coverage_uncovered(check_id: int):
+        with conn() as c:
+            check = coverage.get_check(c, check_id)
+            if check is None:
+                raise HTTPException(status_code=404, detail="覆盖核查记录不存在")
+            results = coverage.get_results(c, check_id)
+        payload = coverage.uncovered_geojson(check, results)
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        name = f"uncovered_check{check_id}_mapv{check['map_version_id']}.geojson"
+        headers = {
+            "Content-Disposition": f"attachment; filename=\"{name}\"; filename*=UTF-8''{quote(name)}",
+            "Cache-Control": "no-store",
+        }
+        return StreamingResponse(iter([body]), media_type="application/geo+json", headers=headers)
+    @app.get("/api/coverage/{check_id}")
+    def coverage_status(check_id: int):
+        """JSON view used by smoke tests and the page's freshness banner."""
+
+        with conn() as c:
+            check = coverage.get_check(c, check_id)
+            if check is None:
+                raise HTTPException(status_code=404, detail="覆盖核查记录不存在")
+            active_map = service.get_active_map(c)
+            results = coverage.get_results(c, check_id)
+        return {
+            "check_id": int(check["id"]),
+            "map_version_id": int(check["map_version_id"]),
+            "map_filename": check["map_filename"],
+            "active_map_version": active_map.id if active_map else None,
+            "stale": coverage.is_stale(check, active_map.id if active_map else None),
+            "feature_count": check["feature_count"],
+            "footprint_area_m2": check["footprint_area_m2"],
+            "total_area_m2": check["total_area_m2"],
+            "covered_area_m2": check["covered_area_m2"],
+            "uncovered_area_m2": check["uncovered_area_m2"],
+            "uncovered_ratio": check["uncovered_ratio"],
+            "uncovered_percent": coverage.ratio_to_percent(check["uncovered_ratio"]),
+            "compartments": [
+                {
+                    "code": row["code"],
+                    "area_m2": row["area_m2"],
+                    "covered_area_m2": row["covered_area_m2"],
+                    "uncovered_area_m2": row["uncovered_area_m2"],
+                    "uncovered_ratio": row["uncovered_ratio"],
+                    "uncovered_percent": coverage.ratio_to_percent(row["uncovered_ratio"]),
+                    "has_uncovered_geometry": row["uncovered_geom"] is not None,
+                }
+                for row in results
             ],
         }
 

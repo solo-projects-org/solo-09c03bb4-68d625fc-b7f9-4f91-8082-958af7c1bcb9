@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from shapely import wkb
+from shapely import force_2d, union_all, wkb
 from shapely.geometry import shape
 from shapely.geometry.base import BaseGeometry
 from shapely.validation import make_valid
@@ -311,3 +311,153 @@ def geometry_to_wkb(geom: BaseGeometry) -> bytes:
 
 def wkb_to_geometry(blob: bytes) -> BaseGeometry:
     return wkb.loads(blob)
+
+
+# --------------------------------------------------------------------------
+# Satellite overpass footprint GeoJSON
+# --------------------------------------------------------------------------
+
+# RFC 7946 mandates WGS84 longitude/latitude.  A legacy ``crs`` member is
+# tolerated only when it names that same CRS, never silently reprojected.
+#   * EPSG:4326 in any URN/spelling form
+#   * OGC:CRS84 (or the slightly mis-spelled URN OGC:1.3:CRS84 seen in the wild)
+#   * a WGS84 geographic name that does not mention a projection
+_FOOTPRINT_WGS84_ALIASES = ("wgs84", "wgs1984", "wgs_1984")
+
+
+def _is_wgs84_name(normalised: str) -> bool:
+    if "crs84" in normalised:
+        return True
+    if "4326" in normalised and ("epsg" in normalised or "crs" in normalised):
+        return True
+    if any(alias in normalised for alias in _FOOTPRINT_WGS84_ALIASES):
+        # "WGS 84 / UTM zone 50N" is projected, not geographic.
+        return not any(
+            marker in normalised
+            for marker in ("utm", "mercator", "pseudo", "web", "projected", "/")
+        )
+    return False
+
+
+@dataclass
+class Footprint:
+    """One overpass footprint: all uploaded polygons united into one geometry."""
+
+    geometry: BaseGeometry
+    part_count: int
+
+
+def _check_footprint_crs(doc: dict[str, Any]) -> None:
+    crs = doc.get("crs")
+    if crs is None:
+        return
+    name = ""
+    if isinstance(crs, dict):
+        properties = crs.get("properties")
+        if isinstance(properties, dict):
+            name = str(properties.get("name") or "")
+        if not name:
+            name = str(crs.get("name") or "")
+    else:
+        name = str(crs)
+    normalised = name.strip().lower().replace(" ", "")
+    if not normalised:
+        # A nameless ``crs`` member conveys nothing; treat it as the RFC 7946
+        # default rather than rejecting an otherwise normal file.
+        return
+    if not _is_wgs84_name(normalised):
+        raise InputError(
+            f"足迹坐标系 {name!r} 不受支持；仅支持 WGS84 经纬度（CRS84 / EPSG:4326），不做重投影"
+        )
+
+
+def parse_footprint_geojson(data: bytes, filename: str) -> Footprint:
+    """Parse and validate an overpass footprint.
+
+    All polygonal features are united before any area is computed, so a swath
+    split into overlapping scenes is only counted once.  Invalid or
+    non-polygonal geometry is rejected outright (nothing is repaired), because
+    a silently altered footprint would make the uncovered-area product wrong.
+    """
+
+    if not data:
+        raise InputError("足迹 GeoJSON 为空")
+    if len(data) > MAX_GEOJSON_BYTES:
+        raise InputError(f"足迹 GeoJSON 超过 {MAX_GEOJSON_BYTES // 1024 // 1024} MB 限制")
+    try:
+        doc = json.loads(_decode(data, "足迹 GeoJSON"))
+    except json.JSONDecodeError as exc:
+        raise InputError(f"足迹 GeoJSON 解析失败：{exc.msg}（第 {exc.lineno} 行）") from None
+    if not isinstance(doc, dict):
+        raise InputError("足迹 GeoJSON 顶层必须是对象")
+    if doc.get("type") == "FeatureCollection":
+        features = doc.get("features")
+        if not isinstance(features, list):
+            raise InputError("FeatureCollection.features 必须是数组")
+    elif doc.get("type") == "Feature":
+        features = [doc]
+    else:
+        raise InputError("足迹 GeoJSON 必须是 Feature 或 FeatureCollection")
+    if not features:
+        raise InputError("足迹 GeoJSON 没有要素")
+    _check_footprint_crs(doc)
+
+    parts: list[BaseGeometry] = []
+    for index, feature in enumerate(features):
+        if len(parts) >= MAX_FEATURES:
+            raise InputError(f"足迹要素超过 {MAX_FEATURES} 个限制")
+        if not isinstance(feature, dict) or feature.get("type") != "Feature":
+            raise InputError(f"第 {index + 1} 个要素不是 Feature 对象")
+        geometry_doc = feature.get("geometry")
+        if not isinstance(geometry_doc, dict):
+            raise InputError(f"第 {index + 1} 个要素缺少几何")
+        try:
+            geom = shape(geometry_doc)
+        except Exception as exc:  # shapely raises a variety of types here
+            raise InputError(f"第 {index + 1} 个要素几何无法解析：{exc}") from None
+        if geom.geom_type not in {"Polygon", "MultiPolygon"}:
+            raise InputError(
+                f"第 {index + 1} 个要素几何类型 {geom.geom_type} 不受支持（足迹必须为面）"
+            )
+        if geom.is_empty:
+            raise InputError(f"第 {index + 1} 个要素几何为空")
+        if not geom.is_valid:
+            raise InputError(
+                f"第 {index + 1} 个要素几何无效（如自相交），请修正后重新上传；"
+                "系统不会静默修复足迹"
+            )
+        bounds = geom.bounds
+        if len(bounds) != 4 or any(value != value for value in bounds):  # NaN guard
+            raise InputError(f"第 {index + 1} 个要素坐标无效")
+        minx, miny, maxx, maxy = bounds
+        if not (
+            -180.0 <= minx <= 180.0
+            and -180.0 <= maxx <= 180.0
+            and -90.0 <= miny <= 90.0
+            and -90.0 <= maxy <= 90.0
+        ):
+            raise InputError(f"第 {index + 1} 个要素坐标超出经纬度范围")
+        if maxx - minx > 180.0:
+            raise InputError(
+                f"第 {index + 1} 个要素经度跨度 {maxx - minx:.1f}° 超过 180°；"
+                "跨 180° 经线的足迹暂不支持"
+            )
+        parts.append(force_2d(geom))
+
+    union = union_all(parts)
+    if union.is_empty:
+        raise InputError("足迹无法合并为有效面")
+    if union.geom_type == "GeometryCollection" and all(
+        part.geom_type in {"Polygon", "MultiPolygon"} for part in union.geoms
+    ):
+        # Topological noise can leave an empty collection wrapper; the
+        # polygonal parts are still a usable footprint.
+        polygons = [part for part in union.geoms if not part.is_empty]
+        if not polygons:
+            raise InputError("足迹无法合并为有效面")
+        union = union_all(polygons)
+    if union.geom_type not in {"Polygon", "MultiPolygon"}:
+        raise InputError("足迹无法合并为有效面")
+    if union.area <= 0:
+        raise InputError("足迹面积为 0，无法核查")
+    return Footprint(geometry=union, part_count=len(parts))

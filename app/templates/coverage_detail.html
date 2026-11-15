@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}核查 #{{ check.id }} · 过境覆盖{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="split">
+    <div>
+      <h2>核查 #{{ check.id }} <span class="muted mono">{{ check.filename }}</span></h2>
+      <p class="hint">
+        {{ check.feature_count }} 个足迹面（已合并去重）· 检查于 {{ check.finished_at or check.created_at }}
+      </p>
+    </div>
+    <div class="actions">
+      <form method="post" action="/coverage/{{ check.id }}/recheck" class="inline">
+        <button type="submit" {% if not active_map %}disabled{% endif %}>按当前底图重新检查</button>
+      </form>
+      <a class="button secondary" href="/coverage/{{ check.id }}/uncovered.geojson">下载未覆盖区域 GeoJSON</a>
+      <a class="button secondary" href="/coverage">返回核查列表</a>
+    </div>
+  </div>
+
+  {% if stale %}
+    <div class="flash flash-warn">
+      <strong>该结果已过期。</strong>
+      本结果读取的是林班底图 <strong>v{{ check.map_version_id }} · {{ check.map_filename }}</strong>
+      {% if active_map %}，但当前活动底图已是 <strong>v{{ active_map.id }} · {{ active_map.filename }}</strong>{% endif %}。
+      此页面的未覆盖比例与 GeoJSON 仍标注并按 v{{ check.map_version_id }} 生成，不会悄悄换成新底图；
+      需要新底图的结果请点“按当前底图重新检查”。
+    </div>
+  {% else %}
+    <div class="flash flash-ok">
+      本结果读取的林班底图 <strong>v{{ check.map_version_id }} · {{ check.map_filename }}</strong>
+      仍是当前活动底图（sha256 <span class="mono">{{ check.map_sha256[:16] }}…</span>）。
+    </div>
+  {% endif %}
+
+  <div class="stat-row">
+    <div class="stat"><span class="num">{{ '%.2f'|format(check.uncovered_ratio * 100) }}%</span><span class="lbl">未覆盖比例（按面积）</span></div>
+    <div class="stat stat-warn"><span class="num">{{ '%.4f'|format(check.uncovered_area_m2 / 1000000) }}</span><span class="lbl">未覆盖面积 (km²)</span></div>
+    <div class="stat stat-ok"><span class="num">{{ '%.4f'|format(check.covered_area_m2 / 1000000) }}</span><span class="lbl">已覆盖面积 (km²)</span></div>
+    <div class="stat stat-mut"><span class="num">{{ '%.4f'|format(check.total_area_m2 / 1000000) }}</span><span class="lbl">林班总面积 (km²)</span></div>
+  </div>
+  <p class="hint">
+    足迹合并后的测地面积 {{ '%.4f'|format(check.footprint_area_m2 / 1000000) }} km²；
+    重叠部分只计一次。面积均为 WGS84 椭球测地面积。
+    有未覆盖区域的林班：<strong>{{ partial_count }}</strong> 个。
+  </p>
+  <p class="hint">
+    汇总行是各林班面积之和。若底图本身存在林班重叠，重叠部分会在各林班分别计入，
+    故汇总总面积可能大于底图并集面积；单个林班的未覆盖比例不受影响。
+  </p>
+</section>
+
+<section class="card">
+  <h2>各林班未覆盖比例</h2>
+  <div class="table-wrap">
+  <table class="rows">
+    <thead>
+      <tr>
+        <th>林班号</th><th>林班面积 (km²)</th><th>已覆盖 (km²)</th><th>未覆盖 (km²)</th>
+        <th>未覆盖比例</th><th>状态</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for row in results %}
+      {% set pct = row.uncovered_ratio * 100 %}
+      <tr class="{{ 'row-mut' if pct >= 99.9999 else ('row-warn' if pct > 0 else 'row-ok') }}">
+        <td class="mono">{{ row.code }}</td>
+        <td class="mono">{{ '%.4f'|format(row.area_m2 / 1000000) }}</td>
+        <td class="mono">{{ '%.4f'|format(row.covered_area_m2 / 1000000) }}</td>
+        <td class="mono">{{ '%.4f'|format(row.uncovered_area_m2 / 1000000) }}</td>
+        <td class="mono">{{ '%.2f'|format(pct) }}%</td>
+        <td>
+          {% if pct <= 0.0000001 %}<span class="pill pill-ok">已完全覆盖</span>
+          {% elif pct >= 99.9999 %}<span class="pill pill-err">完全未覆盖</span>
+          {% else %}<span class="pill pill-warn">部分未覆盖</span>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  <p class="hint">
+    未覆盖比例 = 该林班内未被本足迹覆盖的面积 ÷ 该林班总面积。
+    未覆盖面积小于 1 m² 的缝隙视为数值误差，按已覆盖处理。
+  </p>
+</section>
+{% endblock %}
